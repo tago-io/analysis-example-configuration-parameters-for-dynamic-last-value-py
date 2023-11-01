@@ -17,12 +17,10 @@ Steps to generate an account_token:
 4 - Generate a new Token with Expires Never.
 5 - Press the Copy Button and place at the Environment Variables tab of this analysis.
 """
+import threading
 from queue import Queue
-from datetime import datetime
 
-from tagoio_sdk import Account, Analysis
-from tagoio_sdk.modules.Utils.envToJson import envToJson
-from tagoio_sdk.modules.Utils.getDevice import getDevice
+from tagoio_sdk import Resources, Analysis
 
 
 def get_param(params: list, key: str) -> dict:
@@ -42,20 +40,19 @@ def get_param(params: list, key: str) -> dict:
 
 
 def apply_device_calculation(device: dict, timezone: str) -> None:
-    deviceID, name, account = device["id"], device["name"], device["account"]
-    deviceInfoText = f"{name}({deviceID})"
-    print(f"Processing Device {deviceInfoText})")
-    device = getDevice(account, deviceID)
+    deviceID, name = device["id"], device["name"]
+    print(f"Processing Device {name} - ID {deviceID}")
+    resources = Resources()
 
     # Get the temperature variable inside the device bucket.
     # notice it will get the last record at the time the analysis is running.
-    dataResult = device.getData({"variables": ["temperature"], "query": "last_value"})
+    dataResult = resources.devices.getDeviceData(deviceID, {"variables": ["temperature"], "query": "last_value"})
     if not dataResult:
-        print(f"No data found for {deviceInfoText}")
+        print(f"No data found for {name} - ID {deviceID}")
         return
 
     # Get configuration params list of the device
-    deviceParams = account.devices.paramList(deviceID)
+    deviceParams = resources.devices.paramList(deviceID)
 
     # get the variable temperature from our dataResult array
     temperature = next(
@@ -67,16 +64,12 @@ def apply_device_calculation(device: dict, timezone: str) -> None:
         # get the config. parameter with key last_record_time
         lastRecordParam = get_param(deviceParams, "last_record_time")
 
-        timeString = (
-            datetime.fromtimestamp(temperature["time"])
-            .astimezone(timezone)
-            .strftime("%Y/%m/%d %I:%M %p")
-        )
+        timeString = temperature["time"].strftime("%Y/%m/%d %I:%M %p")
 
-        # creates or edit the tempreature Param with the value of temperature.
+        # creates or edit the temperature Param with the value of temperature.
         # creates or edit the last_record_time Param with the time of temperature.
         # Make sure to cast the value to STRING, otherwise you'll get an error.
-        account.devices.paramSet(
+        resources.devices.paramSet(
             deviceID,
             [
                 {**temperatureParam, "value": str(temperature["value"])},
@@ -86,21 +79,15 @@ def apply_device_calculation(device: dict, timezone: str) -> None:
 
 
 def my_analysis(context: any, scope: list = None) -> None:
-    environment = envToJson(context.environment)
+    resources = Resources()
 
-    if not environment.get("account_token"):
-        raise ValueError("Missing account_token environment var")
-    # Make sure you have account_token tag in the environment variable of the analysis.
-    account = Account({"token": environment["account_token"]})
-
-    # Create a queue, so we don't run on Throughput errors.
-    # The queue will make sure we check only 5 devices simultaneously.
-    processQueue = Queue(maxsize=5)
-    processQueue.put_nowait(apply_device_calculation)
+    # The queue will be filled with device information.
+    # The parameter maxsize is the maximum size of the queue.
+    processQueue = Queue(maxsize=9999)
 
     # fetch device list filtered by tags.
     # Device list always return an Array with DeviceInfo object.
-    deviceList = account.devices.listDevice(
+    deviceList = resources.devices.listDevice(
         {
             "amount": 500,
             "fields": ["id", "name", "tags"],
@@ -108,15 +95,25 @@ def my_analysis(context: any, scope: list = None) -> None:
         }
     )
 
+    timezone = Resources({"token": "MY-PROFILE-TOKEN-HERE"}).account.info().get("timezone", "America/New_York")
+
     for device in deviceList:
-        processQueue.put(
-            device={"id": device["id"], "name": device["name"], "account": account},
-            timezone=account.info().get("timezone", "America/New_York"),
-        )
+        processQueue.put(item=({"id": device["id"], "name": device["name"]}, timezone))
+
+    def worker():
+        while not processQueue.empty():
+            device, timezone = processQueue.get()
+            apply_device_calculation(device, timezone)
+            processQueue.task_done()
+
+    # Start 5 worker threads
+    for _ in range(5):
+        t = threading.Thread(target=worker)
+        t.start()
 
     # Wait for all queue to be processed
     processQueue.join()
 
 
 # The analysis token in only necessary to run the analysis outside TagoIO
-Analysis(params={"token": "MY-ANALYSIS-TOKEN-HERE"}).init(my_analysis)
+Analysis.use(my_analysis, params={"token": "MY-ANALYSIS-TOKEN-HERE"})
